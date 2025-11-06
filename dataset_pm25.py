@@ -1,157 +1,93 @@
-import pickle
-from torch.utils.data import DataLoader, Dataset
-import pandas as pd
-import numpy as np
-import torch
+// demo_profile_opt.c
+// Build:
+//   gcc -O2 -g -fno-omit-frame-pointer -o demo_opt demo_profile_opt.c
+// Run:
+//   ./demo_opt            # or ./demo_opt 2
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
-class PM25_Dataset(Dataset):
-    def __init__(self, eval_length=36, target_dim=36, mode="train", validindex=0):
-        self.eval_length = eval_length
-        self.target_dim = target_dim
+/* -------- Optimized Fibonacci (O(n)) -------- */
+static long fib_fast(int n) {
+    long a = 0, b = 1;
+    for (int i = 0; i < n; i++) {
+        long t = a + b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
 
-        path = "./data/pm25/pm25_meanstd.pk"
-        with open(path, "rb") as f:
-            self.train_mean, self.train_std = pickle.load(f)
-        if mode == "train":
-            month_list = [1, 2, 4, 5, 7, 8, 10, 11]
-            # 1st,4th,7th,10th months are excluded from histmask (since the months are used for creating missing patterns in test dataset)
-            flag_for_histmask = [0, 1, 0, 1, 0, 1, 0, 1] 
-            month_list.pop(validindex)
-            flag_for_histmask.pop(validindex)
-        elif mode == "valid":
-            month_list = [1, 2, 4, 5, 7, 8, 10, 11]
-            month_list = month_list[validindex : validindex + 1]
-        elif mode == "test":
-            month_list = [3, 6, 9, 12]
-        self.month_list = month_list
+/* -------- qsort replacement for bubble sort -------- */
+static int cmp_int(const void *pa, const void *pb) {
+    int a = *(const int*)pa, b = *(const int*)pb;
+    return (a > b) - (a < b);
+}
 
-        # create data for batch
-        self.observed_data = []  # values (separated into each month)
-        self.observed_mask = []  # masks (separated into each month)
-        self.gt_mask = []  # ground-truth masks (separated into each month)
-        self.index_month = []  # indicate month
-        self.position_in_month = []  # indicate the start position in month (length is the same as index_month)
-        self.valid_for_histmask = []  # whether the sample is used for histmask
-        self.use_index = []  # to separate train/valid/test
-        self.cut_length = []  # excluded from evaluation targets
+/* -------- Efficient string builder (exponential growth) -------- */
+typedef struct {
+    char   *buf;
+    size_t  len;
+    size_t  cap;
+} sbuf;
 
-        df = pd.read_csv(
-            "./data/pm25/Code/STMVL/SampleData/pm25_ground.txt",
-            index_col="datetime",
-            parse_dates=True,
-        )
-        df_gt = pd.read_csv(
-            "./data/pm25/Code/STMVL/SampleData/pm25_missing.txt",
-            index_col="datetime",
-            parse_dates=True,
-        )
-        for i in range(len(month_list)):
-            current_df = df[df.index.month == month_list[i]]
-            current_df_gt = df_gt[df_gt.index.month == month_list[i]]
-            current_length = len(current_df) - eval_length + 1
+static void sb_init(sbuf *s) { s->buf = NULL; s->len = 0; s->cap = 0; }
 
-            last_index = len(self.index_month)
-            self.index_month += np.array([i] * current_length).tolist()
-            self.position_in_month += np.arange(current_length).tolist()
-            if mode == "train":
-                self.valid_for_histmask += np.array(
-                    [flag_for_histmask[i]] * current_length
-                ).tolist()
+static int sb_reserve(sbuf *s, size_t need_more) {
+    size_t need = s->len + need_more + 1;   // +1 for '\0'
+    if (need <= s->cap) return 0;
+    size_t newcap = s->cap ? s->cap : 64;
+    while (newcap < need) newcap <<= 1;
+    char *p = (char*)realloc(s->buf, newcap);
+    if (!p) return -1;
+    s->buf = p; s->cap = newcap;
+    return 0;
+}
 
-            # mask values for observed indices are 1
-            c_mask = 1 - current_df.isnull().values
-            c_gt_mask = 1 - current_df_gt.isnull().values
-            c_data = (
-                (current_df.fillna(0).values - self.train_mean) / self.train_std
-            ) * c_mask
+static int sb_append(sbuf *s, const char *add) {
+    size_t addl = strlen(add);
+    if (sb_reserve(s, addl) < 0) return -1;
+    memcpy(s->buf + s->len, add, addl + 1);
+    s->len += addl;
+    return 0;
+}
 
-            self.observed_mask.append(c_mask)
-            self.gt_mask.append(c_gt_mask)
-            self.observed_data.append(c_data)
+static void sb_free(sbuf *s) { free(s->buf); s->buf = NULL; s->len = s->cap = 0; }
 
-            if mode == "test":
-                n_sample = len(current_df) // eval_length
-                # interval size is eval_length (missing values are imputed only once)
-                c_index = np.arange(
-                    last_index, last_index + eval_length * n_sample, eval_length
-                )
-                self.use_index += c_index.tolist()
-                self.cut_length += [0] * len(c_index)
-                if len(current_df) % eval_length != 0:  # avoid double-count for the last time-series
-                    self.use_index += [len(self.index_month) - 1]
-                    self.cut_length += [eval_length - len(current_df) % eval_length]
+/* ---------------- Main ---------------- */
+int main(int argc, char **argv) {
+    int scale = (argc > 1) ? atoi(argv[1]) : 1;
+    if (scale < 1) scale = 1;
 
-        if mode != "test":
-            self.use_index = np.arange(len(self.index_month))
-            self.cut_length = [0] * len(self.use_index)
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        # masks for 1st,4th,7th,10th months are used for creating missing patterns in test data,
-        # so these months are excluded from histmask to avoid leakage
-        if mode == "train":
-            ind = -1
-            self.index_month_histmask = []
-            self.position_in_month_histmask = []
+    /* 1) Sort a big array (now O(n log n) via qsort) */
+    int n = 15000 * scale;
+    int *arr = (int*)malloc((size_t)n * sizeof(int));
+    if (!arr) { perror("malloc"); return 1; }
+    for (int i = 0; i < n; i++) arr[i] = rand();
+    qsort(arr, n, sizeof(int), cmp_int);
 
-            for i in range(len(self.index_month)):
-                while True:
-                    ind += 1
-                    if ind == len(self.index_month):
-                        ind = 0
-                    if self.valid_for_histmask[ind] == 1:
-                        self.index_month_histmask.append(self.index_month[ind])
-                        self.position_in_month_histmask.append(
-                            self.position_in_month[ind]
-                        )
-                        break
-        else:  # dummy (histmask is only used for training)
-            self.index_month_histmask = self.index_month
-            self.position_in_month_histmask = self.position_in_month
+    /* 2) Fast Fibonacci */
+    long fibsum = 0;
+    for (int i = 0; i < 2 * scale; i++) fibsum += fib_fast(42);
 
-    def __getitem__(self, org_index):
-        index = self.use_index[org_index]
-        c_month = self.index_month[index]
-        c_index = self.position_in_month[index]
-        hist_month = self.index_month_histmask[index]
-        hist_index = self.position_in_month_histmask[index]
-        s = {
-            "observed_data": self.observed_data[c_month][
-                c_index : c_index + self.eval_length
-            ],
-            "observed_mask": self.observed_mask[c_month][
-                c_index : c_index + self.eval_length
-            ],
-            "gt_mask": self.gt_mask[c_month][
-                c_index : c_index + self.eval_length
-            ],
-            "hist_mask": self.observed_mask[hist_month][
-                hist_index : hist_index + self.eval_length
-            ],
-            "timepoints": np.arange(self.eval_length),
-            "cut_length": self.cut_length[org_index],
-        }
+    /* 3) Efficient string builder */
+    sbuf sb; sb_init(&sb);
+    for (int i = 0; i < 20000 * scale; i++) {
+        if (sb_append(&sb, "x") < 0) { fprintf(stderr, "alloc failed\n"); break; }
+    }
 
-        return s
+    free(arr);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
 
-    def __len__(self):
-        return len(self.use_index)
+    double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec)/1e9;
+    printf("Done (optimized). scale=%d, time=%.3f s, fibsum=%ld, strlen=%zu\n",
+           scale, dt, fibsum, sb.len);
 
-
-def get_dataloader(batch_size, device, validindex=0):
-    dataset = PM25_Dataset(mode="train", validindex=validindex)
-    train_loader = DataLoader(
-        dataset, batch_size=batch_size, num_workers=1, shuffle=True
-    )
-    dataset_test = PM25_Dataset(mode="test", validindex=validindex)
-    test_loader = DataLoader(
-        dataset_test, batch_size=batch_size, num_workers=1, shuffle=False
-    )
-    dataset_valid = PM25_Dataset(mode="valid", validindex=validindex)
-    valid_loader = DataLoader(
-        dataset_valid, batch_size=batch_size, num_workers=1, shuffle=False
-    )
-
-    scaler = torch.from_numpy(dataset.train_std).to(device).float()
-    mean_scaler = torch.from_numpy(dataset.train_mean).to(device).float()
-
-    return train_loader, valid_loader, test_loader, scaler, mean_scaler
+    sb_free(&sb);
+    return 0;
+}
