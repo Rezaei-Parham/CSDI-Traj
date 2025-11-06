@@ -91,3 +91,10 @@ int main(int argc, char **argv) {
     sb_free(&sb);
     return 0;
 }
+
+# save folded stacks
+perf script | ./FlameGraph/stackcollapse-perf.pl > before.folded
+# (re-run optimized) …
+perf script | ./FlameGraph/stackcollapse-perf.pl > after.folded
+./FlameGraph/difffolded.pl before.folded after.folded \
+  | ./FlameGraph/flamegraph.pl --negate > flame-diff.svg
