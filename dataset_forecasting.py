@@ -1,46 +1,55 @@
-// spawn_until_fail.c — capped, educational demo
-// Compile: gcc -O2 -g -o spawn_until_fail spawn_until_fail.c
-// Run:     ./spawn_until_fail
+int run_container(struct config cfg) {
+    pid_t pid;
 
-#define _GNU_SOURCE
-#include <errno.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#define MAX_TRACK  1024   // track up to 1024 child PIDs
-
-int main(void) {
-    pid_t kids[MAX_TRACK];
-    int nkids = 0;
-
-    printf("[demo] Starting spawns... (PID=%d)\n", getpid());
-    fflush(stdout);
-
-    while (1) {
-        pid_t p = fork();
-        if (p < 0) {
-            perror("[demo] fork failed");
-            break;                          // stop when we hit the limit
-        }
-        if (p == 0) {
-            // child: burn a tiny bit of CPU then sleep so we keep the slot
-            for (volatile long i = 0; i < 1000000; ++i) {}
-            pause();                         // wait until parent kills us
-            _exit(0);
-        } else {
-            // parent
-            if (nkids < MAX_TRACK) kids[nkids++] = p;
-        }
+    // 1) Create a new PID namespace for future children
+    if (unshare(CLONE_NEWPID) == -1) {
+        perror("unshare(CLONE_NEWPID)");
+        return 1;
     }
 
-    printf("[demo] Spawned ~%d children. Cleaning up...\n", nkids);
-    // Terminate children we created (so you don’t have to reboot the VM)
-    for (int i = 0; i < nkids; ++i) kill(kids[i], SIGTERM);
-    for (int i = 0; i < nkids; ++i) waitpid(kids[i], NULL, 0);
+    // 2) Fork: parent stays in old PID namespace; child enters new one
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
 
-    printf("[demo] Done.\n");
+    if (pid == 0) {
+        // ---------- Child: runs inside the new PID namespace ----------
+        printf("[Child] getpid(): %d (should be 1 in new PID namespace)\n", getpid());
+
+        char buf[256];
+        ssize_t n = readlink("/proc/self/ns/pid", buf, sizeof(buf) - 1);
+        if (n >= 0) {
+            buf[n] = '\0';
+            printf("[Child] PID namespace: %s\n", buf);
+        } else {
+            perror("[Child] readlink /proc/self/ns/pid");
+        }
+
+        // Now exec the user command (e.g. "readlink /proc/self/ns/pid")
+        execl("/bin/sh", "sh", "-c", cfg.command, NULL);
+
+        // Only reached if execl fails
+        perror("execl");
+        _exit(1);
+    } else {
+        // ---------- Parent: still in the host PID namespace ----------
+        printf("[Parent] running child with host pid: %d\n", pid);
+
+        char buf[256];
+        ssize_t n = readlink("/proc/self/ns/pid", buf, sizeof(buf) - 1);
+        if (n >= 0) {
+            buf[n] = '\0';
+            printf("[Parent] PID namespace: %s\n", buf);
+        } else {
+            perror("[Parent] readlink /proc/self/ns/pid");
+        }
+
+        printf("[Parent] Stopping...\n");
+        // Parent exits so that only the child remains as "init" of the new namespace
+        exit(0);
+    }
+
     return 0;
 }
