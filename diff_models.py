@@ -1,180 +1,153 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-from linear_attention_transformer import LinearAttentionTransformer
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+#include "kernel/param.h"   // for NPROC if you want the constant
+#define MAXP NPROC   // or just pick 64 if you don't want to include param.h
 
+int
+read_all_processes(struct process_data procs[], int maxp)
+{
+  struct process_data tmp;
+  int n = 0;
+  int before = 0;
 
-def get_torch_trans(heads=8, layers=1, channels=64):
-    encoder_layer = nn.TransformerEncoderLayer(
-        d_model=channels, nhead=heads, dim_feedforward=64, activation="gelu"
-    )
-    return nn.TransformerEncoder(encoder_layer, num_layers=layers)
+  while (1) {
+    int r = next_process(before, &tmp);
+    if (r == 0) {
+      // no more processes
+      break;
+    }
+    if (n < maxp) {
+      procs[n++] = tmp;    // struct copy
+    }
+    before = tmp.pid;      // next time ask for pid > this one
+  }
+  return n;   // number of valid entries
+}
 
-def get_linear_trans(heads=8,layers=1,channels=64,localheads=0,localwindow=0):
+void
+print_indent(int level)
+{
+  for (int i = 0; i < level; i++)
+    printf("  ");  // 2 spaces per level
+}
 
-  return LinearAttentionTransformer(
-        dim = channels,
-        depth = layers,
-        heads = heads,
-        max_seq_len = 256,
-        n_local_attn_heads = 0, 
-        local_attn_window_size = 0,
-    )
+char*
+state_string(int s)
+{
+  // keep this consistent with kernel enum procstate order
+  switch (s) {
+  case 0: return "unused";
+  case 1: return "sleep";
+  case 2: return "runnable";
+  case 3: return "running";
+  case 4: return "zombie";
+  default: return "unknown";
+  }
+}
 
-def Conv1d_with_init(in_channels, out_channels, kernel_size):
-    layer = nn.Conv1d(in_channels, out_channels, kernel_size)
-    nn.init.kaiming_normal_(layer.weight)
-    return layer
+void
+print_proc_line(struct process_data *p, int level)
+{
+  print_indent(level);
+  printf("%d (%d) sz=%d state=%s name=%s\n",
+         p->pid, p->parent_id, p->heap_size,
+         state_string(p->state), p->name);
+}
 
+void
+print_tree(int root_pid, struct process_data procs[], int nprocs, int level)
+{
+  // Find root struct
+  struct process_data *root = 0;
+  for (int i = 0; i < nprocs; i++) {
+    if (procs[i].pid == root_pid) {
+      root = &procs[i];
+      break;
+    }
+  }
+  if (root == 0)
+    return;  // nothing to print
 
-class DiffusionEmbedding(nn.Module):
-    def __init__(self, num_steps, embedding_dim=128, projection_dim=None):
-        super().__init__()
-        if projection_dim is None:
-            projection_dim = embedding_dim
-        self.register_buffer(
-            "embedding",
-            self._build_embedding(num_steps, embedding_dim / 2),
-            persistent=False,
-        )
-        self.projection1 = nn.Linear(embedding_dim, projection_dim)
-        self.projection2 = nn.Linear(projection_dim, projection_dim)
+  print_proc_line(root, level);
 
-    def forward(self, diffusion_step):
-        x = self.embedding[diffusion_step]
-        x = self.projection1(x)
-        x = F.silu(x)
-        x = self.projection2(x)
-        x = F.silu(x)
-        return x
+  // Print all children (processes whose parent_id == root_pid)
+  for (int i = 0; i < nprocs; i++) {
+    if (procs[i].parent_id == root_pid) {
+      print_tree(procs[i].pid, procs, nprocs, level + 1);
+    }
+  }
+}
+int
+find_root_pid(struct process_data procs[], int nprocs)
+{
+  // Try PID 1
+  for (int i = 0; i < nprocs; i++) {
+    if (procs[i].pid == 1)
+      return 1;
+  }
+  // fallback: smallest pid
+  int best = procs[0].pid;
+  for (int i = 1; i < nprocs; i++) {
+    if (procs[i].pid < best)
+      best = procs[i].pid;
+  }
+  return best;
+}
 
-    def _build_embedding(self, num_steps, dim=64):
-        steps = torch.arange(num_steps).unsqueeze(1)  # (T,1)
-        frequencies = 10.0 ** (torch.arange(dim) / (dim - 1) * 4.0).unsqueeze(0)  # (1,dim)
-        table = steps * frequencies  # (T,dim)
-        table = torch.cat([torch.sin(table), torch.cos(table)], dim=1)  # (T,dim*2)
-        return table
+int
+main(int argc, char *argv[])
+{
+  struct process_data procs[MAXP];
+  int nprocs = read_all_processes(procs, MAXP);
 
+  printf("Process tree (pid (ppid) size state name):\n");
 
-class diff_CSDI(nn.Module):
-    def __init__(self, config, inputdim=2):
-        super().__init__()
-        self.channels = config["channels"]
+  int root_pid = find_root_pid(procs, nprocs);
+  print_tree(root_pid, procs, nprocs, 0);
 
-        self.diffusion_embedding = DiffusionEmbedding(
-            num_steps=config["num_steps"],
-            embedding_dim=config["diffusion_embedding_dim"],
-        )
+  exit(0);
+}
 
-        self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
-        self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
-        self.output_projection2 = Conv1d_with_init(self.channels, 1, 1)
-        nn.init.zeros_(self.output_projection2.weight)
+// user/ptree_test.c
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
 
-        self.residual_layers = nn.ModuleList(
-            [
-                ResidualBlock(
-                    side_dim=config["side_dim"],
-                    channels=self.channels,
-                    diffusion_embedding_dim=config["diffusion_embedding_dim"],
-                    nheads=config["nheads"],
-                    is_linear=config["is_linear"],
-                )
-                for _ in range(config["layers"])
-            ]
-        )
+void
+child_work(const char *name)
+{
+  // Give the process a recognizable name
+  printf("%s: pid=%d\n", name, getpid());
+  sleep(1000);   // sleep so pstree can see us
+  exit(0);
+}
 
-    def forward(self, x, cond_info, diffusion_step):
-        B, inputdim, K, L = x.shape
+int
+main(int argc, char *argv[])
+{
+  // First child
+  int pid = fork();
+  if (pid == 0) {
+    child_work("childA");
+  }
 
-        x = x.reshape(B, inputdim, K * L)
-        x = self.input_projection(x)
-        x = F.relu(x)
-        x = x.reshape(B, self.channels, K, L)
+  // Second child
+  pid = fork();
+  if (pid == 0) {
+    // This child forks its own child
+    int gpid = fork();
+    if (gpid == 0) {
+      child_work("grandchildB");
+    }
+    child_work("childB");
+  }
 
-        diffusion_emb = self.diffusion_embedding(diffusion_step)
+  // Parent now execs pstree to show the tree
+  char *args[] = { "pstree", 0 };
+  exec("pstree", args);
 
-        skip = []
-        for layer in self.residual_layers:
-            x, skip_connection = layer(x, cond_info, diffusion_emb)
-            skip.append(skip_connection)
-
-        x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
-        x = x.reshape(B, self.channels, K * L)
-        x = self.output_projection1(x)  # (B,channel,K*L)
-        x = F.relu(x)
-        x = self.output_projection2(x)  # (B,1,K*L)
-        x = x.reshape(B, K, L)
-        return x
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False):
-        super().__init__()
-        self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
-        self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
-        self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
-        self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
-
-        self.is_linear = is_linear
-        if is_linear:
-            self.time_layer = get_linear_trans(heads=nheads,layers=1,channels=channels)
-            self.feature_layer = get_linear_trans(heads=nheads,layers=1,channels=channels)
-        else:
-            self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-            self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-
-
-    def forward_time(self, y, base_shape):
-        B, channel, K, L = base_shape
-        if L == 1:
-            return y
-        y = y.reshape(B, channel, K, L).permute(0, 2, 1, 3).reshape(B * K, channel, L)
-
-        if self.is_linear:
-            y = self.time_layer(y.permute(0, 2, 1)).permute(0, 2, 1)
-        else:
-            y = self.time_layer(y.permute(2, 0, 1)).permute(1, 2, 0)
-        y = y.reshape(B, K, channel, L).permute(0, 2, 1, 3).reshape(B, channel, K * L)
-        return y
-
-
-    def forward_feature(self, y, base_shape):
-        B, channel, K, L = base_shape
-        if K == 1:
-            return y
-        y = y.reshape(B, channel, K, L).permute(0, 3, 1, 2).reshape(B * L, channel, K)
-        if self.is_linear:
-            y = self.feature_layer(y.permute(0, 2, 1)).permute(0, 2, 1)
-        else:
-            y = self.feature_layer(y.permute(2, 0, 1)).permute(1, 2, 0)
-        y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
-        return y
-
-    def forward(self, x, cond_info, diffusion_emb):
-        B, channel, K, L = x.shape
-        base_shape = x.shape
-        x = x.reshape(B, channel, K * L)
-
-        diffusion_emb = self.diffusion_projection(diffusion_emb).unsqueeze(-1)  # (B,channel,1)
-        y = x + diffusion_emb
-
-        y = self.forward_time(y, base_shape)
-        y = self.forward_feature(y, base_shape)  # (B,channel,K*L)
-        y = self.mid_projection(y)  # (B,2*channel,K*L)
-
-        _, cond_dim, _, _ = cond_info.shape
-        cond_info = cond_info.reshape(B, cond_dim, K * L)
-        cond_info = self.cond_projection(cond_info)  # (B,2*channel,K*L)
-        y = y + cond_info
-
-        gate, filter = torch.chunk(y, 2, dim=1)
-        y = torch.sigmoid(gate) * torch.tanh(filter)  # (B,channel,K*L)
-        y = self.output_projection(y)
-
-        residual, skip = torch.chunk(y, 2, dim=1)
-        x = x.reshape(base_shape)
-        residual = residual.reshape(base_shape)
-        skip = skip.reshape(base_shape)
-        return (x + residual) / math.sqrt(2.0), skip
+  // If exec fails:
+  printf("exec pstree failed\n");
+  exit(1);
+}
