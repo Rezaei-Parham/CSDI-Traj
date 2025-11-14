@@ -1,8 +1,11 @@
 #include "kernel/types.h"
 #include "kernel/stat.h"
+#include "kernel/param.h"   // for NPROC
 #include "user/user.h"
-#include "kernel/param.h"   // for NPROC if you want the constant
-#define MAXP NPROC   // or just pick 64 if you don't want to include param.h
+
+#define MAXP NPROC   // max number of processes we’ll store
+
+// --------- Helpers for tree view using next_process ----------
 
 int
 read_all_processes(struct process_data procs[], int maxp)
@@ -35,7 +38,8 @@ print_indent(int level)
 char*
 state_string(int s)
 {
-  // keep this consistent with kernel enum procstate order
+  // Keep this consistent with kernel enum procstate order.
+  // Adjust if your enum differs.
   switch (s) {
   case 0: return "unused";
   case 1: return "sleep";
@@ -78,10 +82,14 @@ print_tree(int root_pid, struct process_data procs[], int nprocs, int level)
     }
   }
 }
+
 int
 find_root_pid(struct process_data procs[], int nprocs)
 {
-  // Try PID 1
+  if (nprocs == 0)
+    return -1;
+
+  // Try PID 1 (init)
   for (int i = 0; i < nprocs; i++) {
     if (procs[i].pid == 1)
       return 1;
@@ -95,59 +103,53 @@ find_root_pid(struct process_data procs[], int nprocs)
   return best;
 }
 
-int
-main(int argc, char *argv[])
-{
-  struct process_data procs[MAXP];
-  int nprocs = read_all_processes(procs, MAXP);
-
-  printf("Process tree (pid (ppid) size state name):\n");
-
-  int root_pid = find_root_pid(procs, nprocs);
-  print_tree(root_pid, procs, nprocs, 0);
-
-  exit(0);
-}
-
-// user/ptree_test.c
-#include "kernel/types.h"
-#include "kernel/stat.h"
-#include "user/user.h"
-
-void
-child_work(const char *name)
-{
-  // Give the process a recognizable name
-  printf("%s: pid=%d\n", name, getpid());
-  sleep(1000);   // sleep so pstree can see us
-  exit(0);
-}
+// ------------------ main: top / top -t -----------------------
 
 int
-main(int argc, char *argv[])
+main(int argc, char **argv)
 {
-  // First child
-  int pid = fork();
-  if (pid == 0) {
-    child_work("childA");
-  }
+  int tree = 0;
 
-  // Second child
-  pid = fork();
-  if (pid == 0) {
-    // This child forks its own child
-    int gpid = fork();
-    if (gpid == 0) {
-      child_work("grandchildB");
+  if (argc == 1) {
+    // just "top"  → flat view via syscall
+    tree = 0;
+  } else if (argc == 2) {
+    if (!strcmp(argv[1], "-t") || !strcmp(argv[1], "--tree")) {
+      tree = 1;
+    } else {
+      printf("usage: top [-t|--tree]\n");
+      exit(1);
     }
-    child_work("childB");
+  } else {
+    printf("usage: top [-t|--tree]\n");
+    exit(1);
   }
 
-  // Parent now execs pstree to show the tree
-  char *args[] = { "pstree", 0 };
-  exec("pstree", args);
+  if (!tree) {
+    // Old behavior: call kernel top() syscall that prints flat listing
+    if (top() < 0) {
+      fprintf(2, "syscall failed (my top syscall)\n");
+    }
+  } else {
+    // New behavior: user-space tree using next_process()
+    struct process_data procs[MAXP];
+    int nprocs = read_all_processes(procs, MAXP);
 
-  // If exec fails:
-  printf("exec pstree failed\n");
-  exit(1);
+    if (nprocs <= 0) {
+      printf("no processes\n");
+      exit(0);
+    }
+
+    printf("Process tree (pid (ppid) size state name):\n");
+
+    int root_pid = find_root_pid(procs, nprocs);
+    if (root_pid < 0) {
+      printf("no root process\n");
+      exit(0);
+    }
+
+    print_tree(root_pid, procs, nprocs, 0);
+  }
+
+  exit(0);
 }
