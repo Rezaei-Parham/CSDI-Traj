@@ -1,67 +1,163 @@
-// kernel/myfield_syscalls.c
+// kernel/time_info_syscall.c
 
 #include <linux/kernel.h>
 #include <linux/syscalls.h>
-#include <linux/sched.h>   // for current and struct task_struct
+#include <linux/ktime.h>
+#include <linux/uaccess.h>
+#include <linux/sched.h>
 
-/*
- * Set my_field for the calling process.
- */
-SYSCALL_DEFINE1(set_my_field, long, value)
+struct time_info {
+    u64 now_ns;    /* current time */
+    u64 enter_ns;  /* last measured syscall entry */
+    u64 exit_ns;   /* last measured syscall exit */
+};
+
+SYSCALL_DEFINE1(time_info, struct time_info __user *, uinfo)
 {
-    current->my_field = value;
+    struct time_info info;
+
+    info.now_ns   = ktime_get_ns();
+    info.enter_ns = current->last_sys_enter_ns;
+    info.exit_ns  = current->last_sys_exit_ns;
+
+    if (copy_to_user(uinfo, &info, sizeof(info)))
+        return -EFAULT;
+
     return 0;
-}
-
-/*
- * Get my_field for the calling process.
- */
-SYSCALL_DEFINE0(get_my_field)
-{
-    return current->my_field;
 }
 
 #define _GNU_SOURCE
+#include <stdio.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/syscall.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <errno.h>
+#include <fcntl.h>
 
-#define __NR_set_my_field 452
-#define __NR_get_my_field 453
+#define __NR_time_info 460
+#define __NR_my_custom 461
 
-int main(int argc, char *argv[])
+struct time_info {
+    uint64_t now_ns;
+    uint64_t enter_ns;
+    uint64_t exit_ns;
+};
+
+static void measure_one(const char *name, void (*do_syscall)(void))
 {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <value>\n", argv[0]);
+    struct time_info before, after;
+
+    /* time before */
+    syscall(__NR_time_info, &before);
+    uint64_t t_user_before = before.now_ns;
+
+    /* the syscall under test */
+    do_syscall();
+
+    /* time after */
+    syscall(__NR_time_info, &after);
+    uint64_t t_user_after   = after.now_ns;
+    uint64_t t_kernel_enter = after.enter_ns;
+    uint64_t t_kernel_exit  = after.exit_ns;
+
+    printf("\n=== %s ===\n", name);
+    printf("User->Kernel  : %lld ns\n",
+           (long long)(t_kernel_enter - t_user_before));
+    printf("Kernel body   : %lld ns\n",
+           (long long)(t_kernel_exit - t_kernel_enter));
+    printf("Kernel->User  : %lld ns\n",
+           (long long)(t_user_after - t_kernel_exit));
+    printf("Total         : %lld ns\n",
+           (long long)(t_user_after - t_user_before));
+}
+
+/* wrappers */
+
+static void do_getpid(void) {
+    (void)getpid();
+}
+
+static int rw_fd_r = -1, rw_fd_w = -1;
+
+static void do_read(void) {
+    char buf[8];
+    (void)read(rw_fd_r, buf, sizeof(buf));
+}
+
+static void do_write(void) {
+    const char buf[8] = "1234567";
+    (void)write(rw_fd_w, buf, sizeof(buf));
+}
+
+static void do_custom(void) {
+    (void)syscall(__NR_my_custom);
+}
+
+int main(void)
+{
+    rw_fd_r = open("/dev/zero", O_RDONLY);
+    rw_fd_w = open("/dev/null", O_WRONLY);
+    if (rw_fd_r < 0 || rw_fd_w < 0) {
+        perror("open");
         return 1;
     }
 
-    long newval = strtol(argv[1], NULL, 10);
+    measure_one("getpid",  do_getpid);
+    measure_one("read",    do_read);
+    measure_one("write",   do_write);
+    measure_one("my_custom", do_custom);
 
-    /* --- 1. Set the new field --- */
-    long ret = syscall(__NR_set_my_field, newval);
-    if (ret == -1) {
-        perror("set_my_field syscall failed");
-        return 1;
-    }
-    printf("Called set_my_field(%ld)\n", newval);
-
-    /* --- 2. Get it back --- */
-    long got = syscall(__NR_get_my_field);
-    if (got == -1 && errno != 0) {
-        perror("get_my_field syscall failed");
-        return 1;
-    }
-
-    printf("get_my_field() returned %ld\n", got);
-
-    /* --- 3. Verification --- */
-    if (got == newval)
-        printf("SUCCESS: field updated correctly!\n");
-    else
-        printf("ERROR: field did not update!\n");
-
+    close(rw_fd_r);
+    close(rw_fd_w);
     return 0;
 }
+
+static uint64_t
+clock_gettime_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+static void
+check_time_info_vs_clock_gettime(int iters)
+{
+    struct time_info info;
+    uint64_t min_diff = (uint64_t)-1;
+    uint64_t max_diff = 0;
+    long double sum_abs_diff = 0.0L;
+
+    for (int i = 0; i < iters; i++) {
+        /* 1. Read user-space high-res clock */
+        uint64_t t_clk = clock_gettime_ns();
+
+        /* 2. Read kernel time via our syscall */
+        if (syscall(__NR_time_info, &info) != 0) {
+            perror("time_info");
+            return;
+        }
+        uint64_t t_sys = info.now_ns;
+
+        /* 3. Compute signed difference: syscall - clock_gettime */
+        long long diff = (long long)(t_sys - t_clk);
+        uint64_t abs_diff = (diff >= 0) ? (uint64_t)diff : (uint64_t)(-diff);
+
+        if (abs_diff < min_diff)
+            min_diff = abs_diff;
+        if (abs_diff > max_diff)
+            max_diff = abs_diff;
+
+        sum_abs_diff += (long double)abs_diff;
+    }
+
+    long double avg_abs = sum_abs_diff / iters;
+
+    printf("\n=== time_info vs clock_gettime(CLOCK_MONOTONIC_RAW) ===\n");
+    printf("Samples: %d\n", iters);
+    printf("Min |Δ| = %llu ns\n", (unsigned long long)min_diff);
+    printf("Max |Δ| = %llu ns\n", (unsigned long long)max_diff);
+    printf("Avg |Δ| = %.2Lf ns\n", avg_abs);
+}
+
+    printf("\n=== Comparing kernel time_info with Linux clock_gettime ===\n");
+    check_time_info_vs_clock_gettime(100000);  // 100k samples
