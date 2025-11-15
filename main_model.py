@@ -1,194 +1,248 @@
-// kernel/get_pcb_times.c
-
-#include <linux/kernel.h>
-#include <linux/syscalls.h>
-#include <linux/sched.h>     // for current, task_struct
-#include <linux/uaccess.h>   // for copy_to_user
-
-struct pcb_times {
-    u64 enter_ns;
-    u64 exit_ns;
-};
-
-/*
- * get_pcb_times(struct pcb_times __user *uinfo)
- *
- * Copies the last measured syscall's entry/exit timestamps
- * from the current process's task_struct into user space.
- */
-SYSCALL_DEFINE1(get_pcb_times, struct pcb_times __user *, uinfo)
-{
-    struct pcb_times t;
-
-    t.enter_ns = current->last_sys_enter_ns;
-    t.exit_ns  = current->last_sys_exit_ns;
-
-    if (copy_to_user(uinfo, &t, sizeof(t)))
-        return -EFAULT;
-
-    return 0;
-}
-
-// kernel/time_info_syscall.c
-
-#include <linux/kernel.h>
-#include <linux/syscalls.h>
-#include <linux/ktime.h>
-#include <linux/uaccess.h>
-#include <linux/sched.h>
-
-struct time_info {
-    u64 now_ns;    /* current time */
-    u64 enter_ns;  /* last measured syscall entry */
-    u64 exit_ns;   /* last measured syscall exit */
-};
-
-SYSCALL_DEFINE1(time_info, struct time_info __user *, uinfo)
-{
-    struct time_info info;
-
-    info.now_ns   = ktime_get_ns();
-    info.enter_ns = current->last_sys_enter_ns;
-    info.exit_ns  = current->last_sys_exit_ns;
-
-    if (copy_to_user(uinfo, &info, sizeof(info)))
-        return -EFAULT;
-
-    return 0;
-}
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <fcntl.h>
+#include <errno.h>
 
-#define __NR_time_info 460
-#define __NR_my_custom 461
+/*
+ * Adjust these two numbers to match your syscall table:
+ *   arch/x86/entry/syscalls/syscall_64.tbl   (or arch-specific equivalent)
+ */
+#define __NR_time_info     454   // <-- change to your time_info number
+#define __NR_get_pcb_times 455   // <-- change to your get_pcb_times number
 
+/* Must match kernel structs exactly */
 struct time_info {
     uint64_t now_ns;
+};
+
+struct pcb_times {
     uint64_t enter_ns;
     uint64_t exit_ns;
 };
 
-static void measure_one(const char *name, void (*do_syscall)(void))
+/* --- Helpers to call the syscalls --- */
+
+static int get_time_info(struct time_info *out)
 {
-    struct time_info before, after;
-
-    /* time before */
-    syscall(__NR_time_info, &before);
-    uint64_t t_user_before = before.now_ns;
-
-    /* the syscall under test */
-    do_syscall();
-
-    /* time after */
-    syscall(__NR_time_info, &after);
-    uint64_t t_user_after   = after.now_ns;
-    uint64_t t_kernel_enter = after.enter_ns;
-    uint64_t t_kernel_exit  = after.exit_ns;
-
-    printf("\n=== %s ===\n", name);
-    printf("User->Kernel  : %lld ns\n",
-           (long long)(t_kernel_enter - t_user_before));
-    printf("Kernel body   : %lld ns\n",
-           (long long)(t_kernel_exit - t_kernel_enter));
-    printf("Kernel->User  : %lld ns\n",
-           (long long)(t_user_after - t_kernel_exit));
-    printf("Total         : %lld ns\n",
-           (long long)(t_user_after - t_user_before));
-}
-
-/* wrappers */
-
-static void do_getpid(void) {
-    (void)getpid();
-}
-
-static int rw_fd_r = -1, rw_fd_w = -1;
-
-static void do_read(void) {
-    char buf[8];
-    (void)read(rw_fd_r, buf, sizeof(buf));
-}
-
-static void do_write(void) {
-    const char buf[8] = "1234567";
-    (void)write(rw_fd_w, buf, sizeof(buf));
-}
-
-static void do_custom(void) {
-    (void)syscall(__NR_my_custom);
-}
-
-int main(void)
-{
-    rw_fd_r = open("/dev/zero", O_RDONLY);
-    rw_fd_w = open("/dev/null", O_WRONLY);
-    if (rw_fd_r < 0 || rw_fd_w < 0) {
-        perror("open");
-        return 1;
+    long ret = syscall(__NR_time_info, out);
+    if (ret < 0) {
+        perror("time_info");
+        return -1;
     }
-
-    measure_one("getpid",  do_getpid);
-    measure_one("read",    do_read);
-    measure_one("write",   do_write);
-    measure_one("my_custom", do_custom);
-
-    close(rw_fd_r);
-    close(rw_fd_w);
     return 0;
 }
 
-static uint64_t
-clock_gettime_ns(void)
+static int get_pcb_times(struct pcb_times *out)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    long ret = syscall(__NR_get_pcb_times, out);
+    if (ret < 0) {
+        perror("get_pcb_times");
+        return -1;
+    }
+    return 0;
 }
 
-static void
-check_time_info_vs_clock_gettime(int iters)
+static void print_with_segments(const char *name,
+                                uint64_t t_before,
+                                uint64_t t_kernel_start,
+                                uint64_t t_kernel_end,
+                                uint64_t t_after)
 {
-    struct time_info info;
-    uint64_t min_diff = (uint64_t)-1;
-    uint64_t max_diff = 0;
-    long double sum_abs_diff = 0.0L;
+    printf("\n=== %s ===\n", name);
+    printf("time_before_user      = %llu ns\n",
+           (unsigned long long)t_before);
+    printf("time_start_in_kernel  = %llu ns\n",
+           (unsigned long long)t_kernel_start);
+    printf("time_end_in_kernel    = %llu ns\n",
+           (unsigned long long)t_kernel_end);
+    printf("time_after_user       = %llu ns\n",
+           (unsigned long long)t_after);
 
-    for (int i = 0; i < iters; i++) {
-        /* 1. Read user-space high-res clock */
-        uint64_t t_clk = clock_gettime_ns();
+    if (t_kernel_start >= t_before &&
+        t_kernel_end   >= t_kernel_start &&
+        t_after        >= t_kernel_end) {
 
-        /* 2. Read kernel time via our syscall */
-        if (syscall(__NR_time_info, &info) != 0) {
-            perror("time_info");
-            return;
-        }
-        uint64_t t_sys = info.now_ns;
+        uint64_t user_to_kernel = t_kernel_start - t_before;
+        uint64_t kernel_body    = t_kernel_end   - t_kernel_start;
+        uint64_t kernel_to_user = t_after        - t_kernel_end;
+        uint64_t total          = t_after        - t_before;
 
-        /* 3. Compute signed difference: syscall - clock_gettime */
-        long long diff = (long long)(t_sys - t_clk);
-        uint64_t abs_diff = (diff >= 0) ? (uint64_t)diff : (uint64_t)(-diff);
+        printf("User -> Kernel        = %llu ns\n",
+               (unsigned long long)user_to_kernel);
+        printf("Kernel body           = %llu ns\n",
+               (unsigned long long)kernel_body);
+        printf("Kernel -> User        = %llu ns\n",
+               (unsigned long long)kernel_to_user);
+        printf("Total                 = %llu ns\n",
+               (unsigned long long)total);
+    } else {
+        printf("Warning: timestamps not monotonic, see raw values above.\n");
+    }
+}
 
-        if (abs_diff < min_diff)
-            min_diff = abs_diff;
-        if (abs_diff > max_diff)
-            max_diff = abs_diff;
+/* ---------- Test getpid ---------- */
 
-        sum_abs_diff += (long double)abs_diff;
+static void test_getpid_once(void)
+{
+    struct time_info tb, ta;
+    struct pcb_times pcb;
+
+    if (get_time_info(&tb) < 0)
+        return;
+
+    pid_t pid = getpid();
+    (void)pid;  // just to avoid unused warning
+
+    if (get_time_info(&ta) < 0)
+        return;
+
+    if (get_pcb_times(&pcb) < 0)
+        return;
+
+    print_with_segments("getpid",
+                        tb.now_ns,
+                        pcb.enter_ns,
+                        pcb.exit_ns,
+                        ta.now_ns);
+}
+
+/* ---------- Test read ---------- */
+
+static void test_read_once(void)
+{
+    int fd = open("testfile_read.bin", O_RDONLY);
+    if (fd < 0) {
+        perror("open testfile_read.bin");
+        return;
     }
 
-    long double avg_abs = sum_abs_diff / iters;
+    char buf[16];
+    struct time_info tb, ta;
+    struct pcb_times pcb;
 
-    printf("\n=== time_info vs clock_gettime(CLOCK_MONOTONIC_RAW) ===\n");
-    printf("Samples: %d\n", iters);
-    printf("Min |Δ| = %llu ns\n", (unsigned long long)min_diff);
-    printf("Max |Δ| = %llu ns\n", (unsigned long long)max_diff);
-    printf("Avg |Δ| = %.2Lf ns\n", avg_abs);
+    if (get_time_info(&tb) < 0) {
+        close(fd);
+        return;
+    }
+
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0) {
+        perror("read");
+        close(fd);
+        return;
+    }
+
+    if (get_time_info(&ta) < 0) {
+        close(fd);
+        return;
+    }
+
+    if (get_pcb_times(&pcb) < 0) {
+        close(fd);
+        return;
+    }
+
+    close(fd);
+
+    print_with_segments("read",
+                        tb.now_ns,
+                        pcb.enter_ns,
+                        pcb.exit_ns,
+                        ta.now_ns);
 }
 
-    printf("\n=== Comparing kernel time_info with Linux clock_gettime ===\n");
-    check_time_info_vs_clock_gettime(100000);  // 100k samples
+/* ---------- Test write ---------- */
+
+static void test_write_once(void)
+{
+    int fd = open("testfile_write.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        perror("open testfile_write.bin");
+        return;
+    }
+
+    const char buf[16] = "abcdefghijklmnop";
+    struct time_info tb, ta;
+    struct pcb_times pcb;
+
+    if (get_time_info(&tb) < 0) {
+        close(fd);
+        return;
+    }
+
+    ssize_t n = write(fd, buf, sizeof(buf));
+    if (n < 0) {
+        perror("write");
+        close(fd);
+        return;
+    }
+
+    if (get_time_info(&ta) < 0) {
+        close(fd);
+        return;
+    }
+
+    if (get_pcb_times(&pcb) < 0) {
+        close(fd);
+        return;
+    }
+
+    close(fd);
+
+    print_with_segments("write",
+                        tb.now_ns,
+                        pcb.enter_ns,
+                        pcb.exit_ns,
+                        ta.now_ns);
+}
+
+/* ---------- Test time_info itself (no PCB segments) ---------- */
+
+static void test_time_info_once(void)
+{
+    /*
+     * Here we just measure how long a time_info call itself takes.
+     * Since time_info does NOT write PCB fields, pcb.enter_ns/exit_ns
+     * would not correspond to this call, so we ignore PCB for this test.
+     */
+
+    struct time_info tb, tcall, ta;
+
+    if (get_time_info(&tb) < 0)
+        return;
+
+    if (get_time_info(&tcall) < 0)
+        return;
+
+    if (get_time_info(&ta) < 0)
+        return;
+
+    uint64_t t_before = tb.now_ns;
+    uint64_t t_after  = ta.now_ns;
+    uint64_t total    = t_after - t_before;
+
+    printf("\n=== time_info (timing the call itself) ===\n");
+    printf("time_before_user = %llu ns\n",
+           (unsigned long long)t_before);
+    printf("time_after_user  = %llu ns\n",
+           (unsigned long long)t_after);
+    printf("Total (one time_info call, approx) = %llu ns\n",
+           (unsigned long long)total);
+}
+
+/* ---------- main ---------- */
+
+int main(void)
+{
+    printf("Syscall timing experiment using time_info:\n");
+
+    test_getpid_once();
+    test_read_once();
+    test_write_once();
+    test_time_info_once();
+
+    return 0;
+}
